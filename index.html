@@ -63,8 +63,8 @@
         // 填入並儲存檔案後，下次開啟網頁就會直接讀取此處的 Key，不再跳出詢問視窗。
         const DEFAULT_API_KEY = ""; 
 
-        // 定義模型優先順序列表：只使用 Gemini 2.5 Flash
-        const MODEL_PRIORITY = ["gemini-2.5-flash"];
+        // 定義模型優先順序列表：使用最新的 Gemini 模型並提供降級選項
+        const MODEL_PRIORITY = ["gemini-2.0-flash-exp", "gemini-1.5-flash-002", "gemini-1.5-flash-latest", "gemini-1.5-flash"];
 
         const SERIF_FAMILY = '"Noto Serif TC", "Noto Serif JP", "Noto Serif", serif';
         
@@ -221,6 +221,7 @@
             const bottomContainerRef = useRef(null);
             const apiKeyInputRef = useRef(null);
             const fileInputRef = useRef(null);
+            const translationCacheRef = useRef(new Map());
 
             const saveApiKey = (key) => {
                 const cleanKey = key ? key.trim() : "";
@@ -348,7 +349,7 @@
                         });
                         if (detected !== srcLang) setOutputs({ en: "", "zh-TW": "", ja: "" });
                     }
-                }, 600);
+                }, 300);
                 return () => clearTimeout(timer);
             }, [src, srcLang]);
 
@@ -358,7 +359,7 @@
                 if (!userApiKey) return; 
                 if (activeTargetLangs.length === 0) return;
 
-                const h = window.setTimeout(() => translate(), 800);
+                const h = window.setTimeout(() => translate(), 400);
                 return () => window.clearTimeout(h);
             }, [src, srcLang, visibleMap, autoRefine, activeTargetLangs.length, userApiKey, glossaryItems]);
 
@@ -375,7 +376,13 @@
                         const body = {
                             system_instruction: { parts: [{ text: promptSystem }] },
                             contents: [{ role: "user", parts: [{ text: promptUser }] }],
-                            generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
+                            generationConfig: {
+                                responseMimeType: "application/json",
+                                temperature: 0.1,
+                                maxOutputTokens: 8192,
+                                topP: 0.95,
+                                topK: 40
+                            },
                         };
 
                         const res = await fetch(url, {
@@ -412,6 +419,91 @@
                 throw lastError || new Error("All models failed");
             }
 
+            async function callGeminiAPIStreaming(promptSystem, promptUser, signal, onChunk) {
+                const keyToUse = userApiKey || DEFAULT_API_KEY;
+                if (!keyToUse) throw new Error("API Key is missing");
+
+                let lastError = null;
+
+                // Try models in order of priority
+                for (const model of MODEL_PRIORITY) {
+                    try {
+                        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${keyToUse}&alt=sse`;
+                        const body = {
+                            system_instruction: { parts: [{ text: promptSystem }] },
+                            contents: [{ role: "user", parts: [{ text: promptUser }] }],
+                            generationConfig: {
+                                responseMimeType: "application/json",
+                                temperature: 0.1,
+                                maxOutputTokens: 8192,
+                                topP: 0.95,
+                                topK: 40
+                            },
+                        };
+
+                        const res = await fetch(url, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(body),
+                            signal,
+                        });
+
+                        if (!res.ok) {
+                            if (res.status === 429) throw new Error("Too Many Requests (429)");
+                            const txt = await res.text();
+                            if (res.status === 404 || res.status === 400) {
+                                console.warn(`Model ${model} failed with ${res.status}, trying next model.`);
+                                throw new Error(`Model ${model} API Error (${res.status}): ${txt}`);
+                            }
+                            throw new Error(`API Error (${res.status}): ${txt}`);
+                        }
+
+                        const reader = res.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        let fullText = '';
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+
+                            buffer += decoder.decode(value, { stream: true });
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop() || '';
+
+                            for (const line of lines) {
+                                if (line.startsWith('data: ')) {
+                                    const data = line.slice(6);
+                                    if (data === '[DONE]') continue;
+
+                                    try {
+                                        const parsed = JSON.parse(data);
+                                        const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+                                        if (text) {
+                                            fullText += text;
+                                            if (onChunk) onChunk(fullText);
+                                        }
+                                    } catch (e) {
+                                        // Skip invalid JSON chunks
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!fullText) throw new Error("No content returned");
+                        try { return JSON.parse(fullText); } catch (e) { throw new Error("Invalid JSON from API"); }
+
+                    } catch (e) {
+                        lastError = e;
+                        if (e.name === "AbortError") throw e;
+                        // Continue to next iteration (fallback model)
+                    }
+                }
+
+                // If all models failed
+                throw lastError || new Error("All models failed");
+            }
+
             async function translate() {
                 setError(null);
                 if (!src.trim() || activeTargetLangs.length === 0) return;
@@ -419,6 +511,28 @@
                 if (controllerRef.current) controllerRef.current.abort();
                 const controller = new AbortController();
                 controllerRef.current = controller;
+
+                // Create cache key
+                const glossaryStr = formatGlossaryForPrompt(glossaryItems);
+                const cacheKey = JSON.stringify({
+                    src: src.trim(),
+                    srcLang,
+                    targets: activeTargetLangs.sort(),
+                    glossary: glossaryStr
+                });
+
+                // Check cache
+                const cached = translationCacheRef.current.get(cacheKey);
+                if (cached) {
+                    setOutputs((prev) => ({ ...prev, ...cached }));
+                    if (autoRefine) {
+                        const tasks = activeTargetLangs
+                            .filter(l => cached[l])
+                            .map(l => refineOne(l, cached[l], controller.signal));
+                        await Promise.all(tasks);
+                    }
+                    return;
+                }
 
                 setBusy(true);
                 setStreaming(true);
@@ -429,11 +543,34 @@
                 });
 
                 try {
-                    const glossaryStr = formatGlossaryForPrompt(glossaryItems);
                     const systemPrompt = buildMultiSystemPrompt(activeTargetLangs);
                     const userPrompt = buildMultiUserPrompt(src, srcLang, activeTargetLangs, glossaryStr);
-                    const parsed = await callGeminiAPI(systemPrompt, userPrompt, controller.signal);
+
+                    // Try streaming first, fallback to regular API if it fails
+                    let parsed;
+                    try {
+                        parsed = await callGeminiAPIStreaming(systemPrompt, userPrompt, controller.signal, (partialText) => {
+                            try {
+                                const partialParsed = JSON.parse(partialText);
+                                setOutputs((prev) => ({ ...prev, ...partialParsed }));
+                            } catch (e) {
+                                // Incomplete JSON, wait for more data
+                            }
+                        });
+                    } catch (streamError) {
+                        // Fallback to non-streaming API
+                        console.warn("Streaming failed, falling back to regular API:", streamError);
+                        parsed = await callGeminiAPI(systemPrompt, userPrompt, controller.signal);
+                    }
+
                     setOutputs((prev) => ({ ...prev, ...parsed }));
+
+                    // Cache the result (limit cache size to 50 entries)
+                    if (translationCacheRef.current.size >= 50) {
+                        const firstKey = translationCacheRef.current.keys().next().value;
+                        translationCacheRef.current.delete(firstKey);
+                    }
+                    translationCacheRef.current.set(cacheKey, parsed);
 
                     if (autoRefine) {
                         const tasks = activeTargetLangs
@@ -781,11 +918,11 @@
                     return;
                 }
                 
-                // Streaming effect
+                // Streaming effect - optimized for faster display
                 let currentIdx = 0;
                 const len = value.length;
-                const intervalTime = 15;
-                const step = Math.max(1, Math.floor(len / 30));
+                const intervalTime = 8;
+                const step = Math.max(1, Math.floor(len / 40));
 
                 setDisplayedText("");
 
